@@ -1,0 +1,12 @@
+services:
+  feedmill:
+    build: .
+    image: feedmill:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      - feedmill-data:/data
+    restart: unless-stopped
+
+volumes:
+  feedmill-data:
