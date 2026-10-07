@@ -4,8 +4,11 @@
 ----
 * 提交后立即返回作业号；后台单 worker 串行处理（同一时刻只有一个作业在跑，
   从存储层面保证同一配方不会被两个作业并发优化，结果不会互相覆盖）。
-* 作业在**启动时**锁定原料库版本与每个配方的当前规格版本，运行期间即使发布了
-  新版本，作业仍用启动时锁定的版本，绝不中途混用。
+* 作业在**提交那一刻**锁定原料库版本与每个配方的规格版本（同一事务写入
+  jobs.library_version_id 与 job_items.recipe_version）：运行期间任何人改
+  配方、发布新库版本都不影响这一批，整批口径一致；作业详情可直接看到每个
+  配方锁的是哪一版，事后对账无需从结果反推。升级前已排队、未记录锁定版本
+  的老作业在启动时补锁当时最新版本，不丢不卡。
 * 取消：尚未开始的配方标记 skipped；正在跑的那一个跑完（计算不可中断且无外部
   IO，耗时很短），其结果写入临时 job_id 并随后随整批一起删除。
   即“取消的作业不得留下半批结果”：取消提交时把作业状态置 cancelling，
@@ -105,6 +108,8 @@ class Scheduler:
         lib = self.db.get_library_version_by_id(lib_version_id)
         # 锁定库版本号
         lib_version = lib["version"]
+        # 每个配方锁定的规格版本：提交时已写入；升级前排队的作业在此补锁
+        locks = self.db.lock_job_item_versions(job_id)
         if not pre_cancelled:
             self.db.set_job_status(job_id, "running", started_at=time.time())
 
@@ -121,12 +126,11 @@ class Scheduler:
                 continue
             self.db.set_item(job_id, item["recipe_code"], "running")
             try:
-                # 每个配方在执行瞬间锁定“当前最新规格版本”；
-                # 库版本始终用作业启动时锁定的 lib_version。
-                rv = self.db.get_recipe_version(item["recipe_code"])
+                # 整批统一用提交时锁定的规格版本与库版本；运行期间的配方
+                # 修改只影响后续作业或即时优化，不混入本批。
                 report = self.optimizer.optimize(
                     item["recipe_code"],
-                    recipe_version=rv["version"],
+                    recipe_version=locks.get(item["recipe_code"]),
                     lib_version=lib_version,
                     use_warm=True,
                     mode="batch",

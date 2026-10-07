@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS job_items (
     recipe_code TEXT NOT NULL,
     seq INTEGER NOT NULL,
     status TEXT NOT NULL,                   -- pending/running/done/failed/skipped
+    recipe_version INTEGER,                 -- 提交时锁定的配方规格版本（升级前数据为 NULL）
     result_id INTEGER,
     error TEXT NOT NULL DEFAULT '',
     UNIQUE (job_id, recipe_code)
@@ -127,10 +128,22 @@ class Storage:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
             conn.executescript(SCHEMA)
+            self._migrate(conn)
             conn.executemany(
                 "INSERT OR IGNORE INTO nutrients(code,name,unit,sort_order,builtin)"
                 " VALUES (?,?,?,?,?)",
                 BUILTIN_NUTRIENTS,
+            )
+
+    @staticmethod
+    def _migrate(conn):
+        """老库就地升级（服务在线、数据卷内有历史与排队作业，只增不改）。"""
+
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(job_items)")}
+        if "recipe_version" not in cols:
+            # 既有行保持 NULL：历史作业不再追溯；排队作业由 worker 启动时补锁
+            conn.execute(
+                "ALTER TABLE job_items ADD COLUMN recipe_version INTEGER"
             )
 
     @contextmanager
@@ -456,6 +469,13 @@ class Storage:
 
     # ---------------------------------------------------------------- jobs
     def create_job(self, library_version_id: int, recipe_codes: list[str]) -> int:
+        """建作业并在**同一事务**内锁定每个配方当前的最新规格版本。
+
+        锁定发生在提交那一刻（与库版本同一时点）：此后改配方、发新库版本
+        都不影响本作业；job_items.recipe_version 即锁定凭证，排队中即可查。
+        配方代码不存在时版本记 NULL，由 worker 启动时补锁（同老数据）。
+        """
+
         with self.connect() as c:
             now = time.time()
             cur = c.execute(
@@ -464,11 +484,52 @@ class Storage:
                 (library_version_id, len(recipe_codes), now),
             )
             jid = cur.lastrowid
+            rows = []
+            for i, code in enumerate(recipe_codes):
+                r = c.execute(
+                    "SELECT MAX(rv.version) v FROM recipes r"
+                    " JOIN recipe_versions rv ON rv.recipe_id=r.id WHERE r.code=?",
+                    (code,),
+                ).fetchone()
+                rows.append((jid, code, i, "pending", r["v"]))
             c.executemany(
-                "INSERT INTO job_items(job_id,recipe_code,seq,status) VALUES (?,?,?,?)",
-                [(jid, code, i, "pending") for i, code in enumerate(recipe_codes)],
+                "INSERT INTO job_items(job_id,recipe_code,seq,status,recipe_version)"
+                " VALUES (?,?,?,?,?)",
+                rows,
             )
             return jid
+
+    def lock_job_item_versions(self, job_id: int) -> dict[str, int | None]:
+        """返回本作业 {配方代码: 锁定的规格版本}。
+
+        升级前排队的作业该项为 NULL：在启动时补锁为当时最新版本并落库，
+        保证老作业不丢不卡；已锁定的行原样返回。
+        """
+
+        with self.connect() as c:
+            rows = c.execute(
+                "SELECT recipe_code,recipe_version FROM job_items WHERE job_id=?",
+                (job_id,),
+            ).fetchall()
+            locks: dict[str, int | None] = {}
+            for row in rows:
+                v = row["recipe_version"]
+                if v is None:
+                    r = c.execute(
+                        "SELECT MAX(rv.version) v FROM recipes r"
+                        " JOIN recipe_versions rv ON rv.recipe_id=r.id"
+                        " WHERE r.code=?",
+                        (row["recipe_code"],),
+                    ).fetchone()
+                    v = r["v"]
+                    if v is not None:
+                        c.execute(
+                            "UPDATE job_items SET recipe_version=?"
+                            " WHERE job_id=? AND recipe_code=?",
+                            (v, job_id, row["recipe_code"]),
+                        )
+                locks[row["recipe_code"]] = v
+            return locks
 
     def get_job(self, job_id: int) -> dict | None:
         with self.connect() as c:
@@ -477,8 +538,8 @@ class Storage:
                 return None
             d = dict(r)
             items = c.execute(
-                "SELECT recipe_code,seq,status,result_id,error FROM job_items"
-                " WHERE job_id=? ORDER BY seq",
+                "SELECT recipe_code,seq,status,recipe_version,result_id,error"
+                " FROM job_items WHERE job_id=? ORDER BY seq",
                 (job_id,),
             ).fetchall()
             d["items"] = [dict(x) for x in items]

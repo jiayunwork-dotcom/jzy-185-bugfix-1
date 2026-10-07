@@ -106,9 +106,25 @@
 * 批量作业：
   * 提交即返回作业号；后台单 worker 串行处理（天然避免同一配方被两个
     作业并发优化）。
-  * **版本锁定**：作业行在提交时固定 `library_version_id`，运行期间发布
-    新版本不影响在跑作业，绝不中途混用（`test_job_version_lock`）。
-  * 每个配方在执行瞬间锁定当时最新配方规格版本。
+  * **版本锁定（提交那一刻）**：建作业的同一事务内固定
+    `jobs.library_version_id` 并把每个配方当时的最新规格版本写入
+    `job_items.recipe_version`。运行期间任何人改配方、发布新库版本都
+    不影响这一批，整批是同一时点的快照，口径一致、成本可互相比较
+    （`test_job_version_lock`、`test_job_recipe_version_lock_during_run`）。
+    作业详情的每个条目都带 `recipe_version`，排队中即可见，事后对账
+    无需从结果反推。
+  * **为什么锁在提交时而非开跑时**：库版本本来就锁在提交时，配方版本
+    跟齐后整个作业才是同一时点的快照（“开跑时的配方 + 提交时的价格”
+    这种混搭两边都不是）；提交即可预期、排队中即可对账。代价：提交后
+    对配方的修改不会进入该作业——即使它排队很久。补救是显式的：取消
+    重提即按当时状态重新锁定，或对单个配方做即时优化（即时优化永远
+    用最新版本，除非显式指定 `recipe_version`）。
+  * **升级兼容**：老库的 `job_items` 没有 `recipe_version` 列，启动时
+    `ALTER TABLE` 补列，既有行保持 NULL。历史作业数据原样保留；升级前
+    已排队、未记录锁定版本的作业在 worker 启动它时补锁当时最新版本
+    （`lock_job_item_versions`），不丢、不卡（
+    `test_legacy_pending_job_locked_at_start`、
+    `test_storage_migration_preserves_job_items`）。
   * 默认目标集合 = 所有引用了两版本间“受影响原料”的配方。
   * **取消**：未开始项全部 `skipped`；在跑的那一项跑完后随整批处理——
     作业产生的结果按 `job_id` 全部物理删除；热启动基在作业成功结束时
