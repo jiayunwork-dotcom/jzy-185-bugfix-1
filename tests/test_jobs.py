@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 
 import pytest
@@ -123,7 +124,6 @@ def test_cancel_before_start_is_respected(client, monkeypatch):
     # 先暂停 worker（替换 pending_job 让它暂时拿不到作业），插入作业后置 cancelling
     sched = client.app.state.scheduler
     orig = db.pending_job
-    import threading
     gate = threading.Event()
     def blocked_pending():
         gate.wait(timeout=5)
@@ -185,3 +185,125 @@ def test_concurrent_jobs_same_recipe_no_overwrite(client):
     r2 = client.get(f"/api/results/{id2}").json()["report"]
     assert r1["library_version"] == 2
     assert r2["library_version"] == 3
+
+
+# ----------------------------------------- 配方规格版本在提交时刻整批锁定
+def _seed_priced_batch(client, n: int, cp_base: float = 0.16, cp_step: float = 0.0005):
+    """三原料两版价；建 n 个配方，第 i 个 CP 下限 = cp_base + cp_step*i。"""
+
+    client.post("/api/library/publish", json={"ingredients": [CORN, SBM, WHEAT]})
+    for i in range(n):
+        client.put(f"/api/recipes/r{i}", json={
+            "code": f"r{i}", "name": f"配方{i}",
+            "ingredients": [
+                {"code": "corn"}, {"code": "sbm"}, {"code": "wheat"},
+            ],
+            "nutrients": [{"code": "CP", "lower": cp_base + cp_step * i}],
+            "ratios": [],
+        })
+    r = client.post("/api/library/publish", json={"ingredients": [
+        {**CORN, "price": 0.32}, {**SBM, "price": 0.47}, {**WHEAT, "price": 0.21},
+    ]})
+    assert r.status_code == 201
+    return client.get("/api/library").json()["id"]
+
+
+def _set_last_recipe_cp30(client, n: int):
+    code = f"r{n - 1}"
+    r = client.put(f"/api/recipes/{code}", json={
+        "code": code, "name": f"配方{n - 1}",
+        "ingredients": [
+            {"code": "corn"}, {"code": "sbm"}, {"code": "wheat"},
+        ],
+        "nutrients": [{"code": "CP", "lower": 0.30}],
+        "ratios": [],
+    })
+    assert r.status_code == 201
+    assert r.json()["version"] == 2
+
+
+def test_batch_recipe_version_lock_midrun_edit(client, monkeypatch):
+    """稳定复现场景：60 个配方的全量重优化跑到中途时，把最后一个配方的
+    CP 下限改成 30%（产生规格 v2）。整批仍必须按提交时锁定的 v1 规格计算，
+    成本约 0.2529；作业详情显示锁定的是 v1。改后再做即时优化才得到 0.3487。"""
+
+    n = 60
+    _seed_priced_batch(client, n)
+
+    db = client.app.state.storage
+    gate = threading.Event()
+    original_set_item = db.set_item
+
+    # 在前几个配方处理完后暂停 worker，留出“运行中改配方”的窗口
+    def paused_set_item(job_id, recipe_code, status, **fields):
+        original_set_item(job_id, recipe_code, status, **fields)
+        if status == "done" and recipe_code == "r3":
+            assert gate.wait(timeout=5)
+
+    monkeypatch.setattr(db, "set_item", paused_set_item)
+
+    jid = client.post("/api/jobs", json={}).json()["job_id"]
+
+    # 等 worker 处理到暂停点
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        job = client.get(f"/api/jobs/{jid}").json()
+        if any(it["status"] == "done" for it in job["items"]):
+            break
+        time.sleep(0.005)
+    # 此刻改最后一个配方（它还排在后面，尚未执行）
+    _set_last_recipe_cp30(client, n)
+    gate.set()  # 放行
+
+    job = _wait(client, jid)
+    assert job["status"] == "completed"
+    assert job["processed"] == n
+
+    last = job["items"][-1]
+    assert last["recipe_code"] == f"r{n - 1}"
+    # 作业详情直接可见每个配方锁定的规格版本，无需从结果反推
+    assert last["recipe_version"] == 1
+    for it in job["items"]:
+        assert it["status"] == "done"
+        assert it["recipe_version"] == 1
+
+    report = client.get(f"/api/results/{last['result_id']}").json()["report"]
+    assert report["recipe_version"] == 1          # 锁定 v1，不是改后的 v2
+    assert report["cost"] == pytest.approx(0.2529, abs=1e-3)
+    # 同批口径一致：全部绑定库 v2
+    assert report["library_version"] == 2
+
+    # 作业结束后单独即时优化：按新规格 v2，约 0.3487
+    instant = client.post("/api/optimize", json={"recipe_code": f"r{n - 1}"}).json()
+    assert instant["status"] == "optimal"
+    assert instant["recipe_version"] == 2
+    assert instant["cost"] == pytest.approx(0.3487, abs=1e-3)
+
+
+def test_queued_job_locks_spec_at_submit(client, monkeypatch):
+    """作业还在排队（未开始）时配方被修改：仍按提交时锁定的旧规格执行。"""
+
+    n = 3
+    _seed_priced_batch(client, n)
+    db = client.app.state.storage
+    sched = client.app.state.scheduler
+
+    orig = db.pending_job
+    gate = threading.Event()
+    monkeypatch.setattr(
+        db, "pending_job", lambda: gate.wait(timeout=5) and orig()
+    )
+    lib_id = db.get_library(2)["id"]
+    jid = sched.submit(lib_id, ["r0", "r1", "r2"])
+    # 排队期间把 r0 的 CP 下限提到 30%（v2）
+    _set_last_recipe_cp30(client, 1)
+    gate.set()
+
+    job = _wait(client, jid)
+    assert job["status"] == "completed"
+    first = job["items"][0]
+    assert first["recipe_version"] == 1
+    report = client.get(f"/api/results/{first['result_id']}").json()["report"]
+    assert report["recipe_version"] == 1
+    # 提交时锁定的是 0.16 下限（cp_base + 0），成本应远低于 30% 规格
+    assert report["cost"] < 0.26

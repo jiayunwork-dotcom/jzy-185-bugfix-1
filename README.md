@@ -83,7 +83,7 @@ curl -s -XPOST localhost:8000/api/compare -H 'Content-Type: application/json' \
 | `POST /api/optimize` | 即时优化（可指定库/配方版本、`warm_start`） |
 | `GET /api/recipes/{code}/results` / `GET /api/results/{id}` | 结果历史 / 详情 |
 | `POST /api/compare` | 同一配方两个结果的用量差、成本差 |
-| `POST /api/jobs` / `GET /api/jobs/{id}` / `POST /api/jobs/{id}/cancel` | 批量作业 |
+| `POST /api/jobs` / `GET /api/jobs/{id}` / `POST /api/jobs/{id}/cancel` | 批量作业。提交即锁定库版本与每个配方当时的规格版本，运行期间改配方/发新价不影响本批；作业详情每个条目带锁定的 `recipe_version` |
 
 ## 优化结果报告字段（节选）
 

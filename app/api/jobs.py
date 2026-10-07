@@ -39,7 +39,14 @@ def submit_job(body: BatchIn, request: Request):
             status_code=422,
             detail=[{"field": "recipe_codes", "message": "没有需要重优化的配方"}],
         )
-    jid = sched.submit(lib["id"], recipe_codes)
+    try:
+        jid = sched.submit(lib["id"], recipe_codes)
+    except LookupError as exc:
+        # 提交瞬间逐个锁定配方当前最新版本；配方此刻缺失则拒绝整批
+        raise HTTPException(
+            status_code=422,
+            detail=[{"field": "recipe_codes", "message": str(exc)}],
+        )
     return {"job_id": jid, "total": len(recipe_codes), "library_version": lib["version"]}
 
 

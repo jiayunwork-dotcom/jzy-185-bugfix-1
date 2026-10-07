@@ -95,6 +95,8 @@ CREATE TABLE IF NOT EXISTS job_items (
     status TEXT NOT NULL,                   -- pending/running/done/failed/skipped
     result_id INTEGER,
     error TEXT NOT NULL DEFAULT '',
+    recipe_version_id INTEGER,             -- 提交时刻锁定的配方规格版本（快照 id）
+    recipe_version INTEGER,                -- 同一版本的版本号，便于展示与对账
     UNIQUE (job_id, recipe_code)
 );
 
@@ -132,6 +134,47 @@ class Storage:
                 " VALUES (?,?,?,?,?)",
                 BUILTIN_NUTRIENTS,
             )
+            self._migrate_job_item_recipe_locks(conn)
+
+    @staticmethod
+    def _column_exists(conn, table: str, column: str) -> bool:
+        return any(
+            row["name"] == column
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        )
+
+    def _migrate_job_item_recipe_locks(self, conn):
+        """给旧卷补 job_items 的配方版本锁列，并回填历史/排队作业。
+
+        升级语义：历史作业不能丢、排队作业不能卡。回填顺序——
+        1) 已有结果的项：以结果实际绑定的 recipe_version_id 为准（对账口径）；
+        2) 其余项（排队中、跳过、失败、无结果的完成项）：回填当时最新规格版本。
+        队列里的旧作业因此获得确定的锁定版本，启动后按该版本跑，不会再读“当前最新”。
+        """
+
+        if self._column_exists(conn, "job_items", "recipe_version_id"):
+            return
+        conn.execute("ALTER TABLE job_items ADD COLUMN recipe_version_id INTEGER")
+        conn.execute("ALTER TABLE job_items ADD COLUMN recipe_version INTEGER")
+        conn.execute(
+            "UPDATE job_items SET recipe_version_id = ("
+            "  SELECT r.recipe_version_id FROM optimization_results r"
+            "  WHERE r.id = job_items.result_id)"
+            " WHERE result_id IS NOT NULL"
+        )
+        conn.execute(
+            "UPDATE job_items SET recipe_version_id = ("
+            "  SELECT rv.id FROM recipes r"
+            "  JOIN recipe_versions rv ON rv.recipe_id = r.id"
+            "  WHERE r.code = job_items.recipe_code"
+            "  ORDER BY rv.version DESC LIMIT 1)"
+            " WHERE recipe_version_id IS NULL"
+        )
+        conn.execute(
+            "UPDATE job_items SET recipe_version = ("
+            "  SELECT rv.version FROM recipe_versions rv"
+            "  WHERE rv.id = job_items.recipe_version_id)"
+        )
 
     @contextmanager
     def connect(self):
@@ -456,6 +499,12 @@ class Storage:
 
     # ---------------------------------------------------------------- jobs
     def create_job(self, library_version_id: int, recipe_codes: list[str]) -> int:
+        """创建作业，并在**提交时刻**为每个配方锁定当前最新规格版本。
+
+        与提交时刻锁定的 library_version_id 一起构成该批次的一致快照；
+        作业运行期间配方再被修改只产生新版本，不影响本批。
+        """
+
         with self.connect() as c:
             now = time.time()
             cur = c.execute(
@@ -464,9 +513,21 @@ class Storage:
                 (library_version_id, len(recipe_codes), now),
             )
             jid = cur.lastrowid
+            rows: list[tuple] = []
+            for i, code in enumerate(recipe_codes):
+                r = c.execute(
+                    "SELECT rv.id, rv.version FROM recipes r"
+                    " JOIN recipe_versions rv ON rv.recipe_id = r.id"
+                    " WHERE r.code = ? ORDER BY rv.version DESC LIMIT 1",
+                    (code,),
+                ).fetchone()
+                if r is None:
+                    raise LookupError(f"配方不存在或尚无规格版本: {code}")
+                rows.append((jid, code, i, "pending", r["id"], r["version"]))
             c.executemany(
-                "INSERT INTO job_items(job_id,recipe_code,seq,status) VALUES (?,?,?,?)",
-                [(jid, code, i, "pending") for i, code in enumerate(recipe_codes)],
+                "INSERT INTO job_items(job_id,recipe_code,seq,status,"
+                "recipe_version_id,recipe_version) VALUES (?,?,?,?,?,?)",
+                rows,
             )
             return jid
 
@@ -477,7 +538,8 @@ class Storage:
                 return None
             d = dict(r)
             items = c.execute(
-                "SELECT recipe_code,seq,status,result_id,error FROM job_items"
+                "SELECT recipe_code,seq,status,result_id,error,"
+                "recipe_version_id,recipe_version FROM job_items"
                 " WHERE job_id=? ORDER BY seq",
                 (job_id,),
             ).fetchall()
